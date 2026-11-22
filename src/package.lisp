@@ -12,6 +12,7 @@
    #:smb-entry-attributes #:smb-list #:smb-map-entries #:smb-stat #:smb-statvfs
    ;; reading and writing
    #:smb-read-range #:smb-get #:smb-put #:smb-write-range #:smb-read-file
+   #:smb-map-file #:smb-open-write #:smb-write #:smb-finish-write #:smb-abandon-write #:*smb-ahead*
    ;; changing it
    #:smb-mkdir #:smb-rmdir #:smb-delete #:smb-rename #:smb-set-mtime
    ;; when it goes wrong

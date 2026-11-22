@@ -44,7 +44,10 @@
   key signing-key signing-p
   server-signing-required
   ;; reused for every message, so a megabyte moved is not megabytes of garbage
-  (send-buf (octets 0)) (recv-buf (octets 0)))
+  (send-buf (octets 0)) (recv-buf (octets 0))
+  ;; requests sent and not yet answered to their sender, by message id: NIL while the answer is to come, or
+  ;; the answer itself (a fresh copy, checked) when it came while another was awaited -- several in flight
+  (in-flight (make-hash-table)))
 
 (defun %room (v n)
   "V if it holds N bytes, else a bigger one (twice, to grow seldom)."
@@ -129,6 +132,14 @@
    (values STATUS RESPONSE-BODY HEADER).  RAW (a read's big answer): (values STATUS FRAME LENGTH), the
    frame in the session's receive buffer, good until the next request.  Signals SMB-ERROR unless the
    status is in OK.  CHARGE is the request's credit charge (a large read or write costs one per 64 KB)."
+  (%await s (%send-request s command body :charge charge :sign sign :tree-id tree-id
+                                          :data data :start start :end end)
+          :ok ok :raw raw))
+
+(defun %send-request (s command body &key (charge 1) (sign (smb-session-signing-p s)) tree-id
+                                          data (start 0) (end (and data (length data))))
+  "Send COMMAND with BODY (and DATA[START,END)) without waiting: its message id, for %AWAIT.  The message is
+   built in the session's buffer and written out whole, so the buffer is free again on return."
   (let* ((header (if tree-id (%header s command charge :tree-id tree-id) (%header s command charge)))
          (n (+ 64 (length body) (if data (- end start) 0)))
          (msg (setf (smb-session-send-buf s) (%room (smb-session-send-buf s) n)))
@@ -141,24 +152,44 @@
       (replace msg (%signature s msg n) :start1 48))
     (incf (smb-session-next-mid s) charge)
     (decf (smb-session-credits s) charge)
+    (setf (gethash mid (smb-session-in-flight s)) nil)
     (%send-frame s msg n)
+    mid))
+
+(defun %answer (s r rn ok raw)
+  "The answer R (RN long, checked): its values as %REQUEST gives them, or SMB-ERROR."
+  (let ((status (u32 r 8)))
+    (unless (member status ok)
+      (error (if (member status '(#xC000006D #xC0000072 #xC0000071 #xC0000224 #xC000015B))
+                 'smb-auth-error 'smb-error)
+             :status status))
+    (if raw (values status r rn) (values status (subseq r 64 rn) r))))
+
+(defun %await (s mid &key (ok '(0)) raw)
+  "The answer to the request MID, as %REQUEST gives it.  Answers to others in flight that come first are
+   checked and set aside for them; anything else (an oplock break we did not ask for) is dropped."
+  (let ((waiting (smb-session-in-flight s)))
+    (multiple-value-bind (kept there) (gethash mid waiting)
+      (unless there (error 'smb-error :message (format nil "no request ~d is waiting for an answer" mid)))
+      (when kept
+        (remhash mid waiting)
+        (return-from %await (%answer s kept (length kept) ok raw))))
     (loop
-      (multiple-value-bind (r rn) (%recv-frame s raw)
-       (let ((status (u32 r 8)) (flags (u32 r 16)))
+      (multiple-value-bind (r rn) (%recv-frame s t)
         (unless (and (>= rn 64) (= (aref r 0) #xFE))
           (error 'smb-error :message "the server answered with something that is not SMB2"))
-        (incf (smb-session-credits s) (u16 r 14))
-        (cond ((/= (u64 r 24) mid))                   ; not ours (an oplock break we did not ask for)
-              ((and (= status #x103) (logtest flags +flag-async+)))   ; interim: the answer follows
-              (t
-               (when (and (smb-session-signing-p s) (logtest flags +flag-signed+)
-                          (not (%signature-ok-p s r rn)))
-                 (error 'smb-error :message "a reply's signature does not match: the connection is not safe"))
-               (unless (member status ok)
-                 (error (if (member status '(#xC000006D #xC0000072 #xC0000071 #xC0000224 #xC000015B))
-                            'smb-auth-error 'smb-error)
-                        :status status))
-               (return (if raw (values status r rn) (values status (subseq r 64 rn) r))))))))))
+        (let ((status (u32 r 8)) (flags (u32 r 16)) (rid (u64 r 24)))
+          (incf (smb-session-credits s) (u16 r 14))
+          (cond ((and (= status #x103) (logtest flags +flag-async+)))   ; interim: the answer follows
+                ((not (nth-value 1 (gethash rid waiting))))            ; not ours (an oplock break)
+                (t
+                 (when (and (smb-session-signing-p s) (logtest flags +flag-signed+)
+                            (not (%signature-ok-p s r rn)))
+                   (error 'smb-error :message "a reply's signature does not match: the connection is not safe"))
+                 (if (= rid mid)
+                     (progn (remhash mid waiting)
+                            (return (%answer s r rn ok raw)))
+                     (setf (gethash rid waiting) (subseq r 0 rn))))))))))
 
 ;;; ---- negotiate, logon, share ---------------------------------------------------------------------
 
@@ -348,14 +379,55 @@
   (multiple-value-bind (r start end) (%read-in-place s fid offset n)
     (subseq r start end)))
 
+(defparameter *smb-ahead* 8
+  "Reads or writes a whole-file transfer keeps in flight (as the server's credits allow): each waits a round
+   trip, and one at a time a transfer moved a chunk a round trip.")
+
+(defun %read-request (s fid offset n)
+  (%send-request s 8 (cat (le16 49) (octets-of #x50 0) (le32 n) (le64 offset) fid
+                          (le32 0) (le32 0) (le32 0) (le16 0) (le16 0) (octets 1))
+                 :charge (%charge s n)))
+
+(defun %drain (s mids)
+  "The answers to MIDS read and dropped (a transfer given up), so the session is left in step."
+  (let ((*wait-hook* nil))
+    (dolist (m mids) (ignore-errors (%await s m :ok '(0 #xC0000011))))))
+
 (defun %read-file (s path fn offset)
-  "FN called with (frame start end) for each piece of PATH from OFFSET, in place; the total."
+  "FN called with (frame start end) for each piece of PATH from OFFSET, in place, in order; the total.  Up to
+   *SMB-AHEAD* reads in flight, as the credits allow."
   (with-handle (fid s path)
-    (let ((at offset))
-      (loop (multiple-value-bind (r start end) (%read-in-place s fid at (%chunk s (smb-session-max-read s)))
-              (when (= start end) (return (- at offset)))
-              (funcall fn r start end)
-              (incf at (- end start)))))))
+    (let* ((chunk (min (smb-session-max-read s) (* 16 65536)))
+           (queue '()) (next offset) (eof nil) (at offset))
+      (flet ((ask ()
+               ;; a read's charge must be in hand; one at a time as a last resort
+               (loop while (and (not eof) (< (length queue) *smb-ahead*)
+                                (or (null queue) (>= (smb-session-credits s) (%charge s chunk))))
+                     do (let ((n (if queue chunk (%chunk s chunk))))
+                          (setf queue (nconc queue (list (list next n (%read-request s fid next n)))))
+                          (incf next n)))))
+        (unwind-protect
+             (progn
+               (ask)
+               (loop while queue
+                     do (destructuring-bind (off n mid) (pop queue)
+                          (multiple-value-bind (status r) (%await s mid :ok '(0 #xC0000011) :raw t)
+                            (cond ((= status #xC0000011) (setf eof t))
+                                  (t (let* ((start (aref r (+ 64 2))) (got (u32 r (+ 64 4))))
+                                       (unless (= off at)
+                                         (error 'smb-error :message "a read came back out of its place"))
+                                       (funcall fn r start (+ start got))
+                                       (incf at got)
+                                       (when (< got n)
+                                         ;; short: the end of the file; what was asked past it says EOF
+                                         (setf eof t)
+                                         (when queue
+                                           ;; unless the file is still growing: ask again from here
+                                           (%drain s (mapcar #'third queue))
+                                           (setf queue '() next at eof nil)))))))
+                          (ask)))
+               (- at offset))
+          (%drain s (mapcar #'third queue)))))))
 
 (defun smb-read-range (s path offset length)
   "LENGTH bytes of PATH from OFFSET (fewer at its end)."
@@ -370,6 +442,76 @@
 (defun smb-read-file (s path fn &key (offset 0))
   "Call FN with each piece of PATH (an octet vector) from OFFSET to its end, in order.  The total."
   (%read-file s path (lambda (r start end) (funcall fn (subseq r start end))) offset))
+
+(defun smb-map-file (s path fn)
+  "Call FN with (BUFFER START END) for each piece of PATH, in order -- where it arrived, good only until FN
+   returns.  The total."
+  (%read-file s path fn 0))
+
+;;; A file written a piece at a time, from wherever the bytes come (another server, say): opened, written as
+;;; the bytes come -- gathered into the server's largest writes, *SMB-AHEAD* of them in flight -- and closed.
+(defstruct (smb-writer (:constructor %make-smb-writer (session fid buf)))
+  session fid buf (fill 0)
+  (offset 0)              ; where the gathered bytes go
+  (queue '()))            ; writes in flight, oldest first: (bytes mid)
+
+(defun smb-open-write (s path)
+  "PATH opened for writing, made or emptied: a writer for SMB-WRITE, then SMB-FINISH-WRITE (or, given up,
+   SMB-ABANDON-WRITE)."
+  (%make-smb-writer s (%create s path :access +write-access+ :disposition 5 :options #x40)
+                    (octets (min (smb-session-max-write s) (* 16 65536)))))
+
+(defun %write-request (s fid offset data start end)
+  (%send-request s 9 (cat (le16 49) (le16 112) (le32 (- end start)) (le64 offset) fid
+                          (le32 0) (le32 0) (le16 0) (le16 0) (le32 0))
+                 :data data :start start :end end :charge (%charge s (- end start))))
+
+(defun %writer-take (w)
+  "The oldest write in flight, answered (all of it written, or an error)."
+  (destructuring-bind (n mid) (pop (smb-writer-queue w))
+    (multiple-value-bind (status r) (%await (smb-writer-session w) mid)
+      (declare (ignore status))
+      (unless (= (u32 r 4) n) (error 'smb-error :message "the server wrote less than it was given")))))
+
+(defun %writer-flush (w)
+  "The gathered bytes sent, as one write or more (as the credits allow), without waiting for them."
+  (let* ((s (smb-writer-session w)) (buf (smb-writer-buf w)) (end (smb-writer-fill w)) (i 0))
+    (loop while (< i end)
+          do ;; room among the writes in flight, and the charge in hand: else wait for the oldest
+             (loop while (and (smb-writer-queue w)
+                              (or (>= (length (smb-writer-queue w)) *smb-ahead*)
+                                  (< (smb-session-credits s) (%charge s (- end i)))))
+                   do (%writer-take w))
+             (let ((n (min (- end i) (%chunk s (- end i)))))
+               (setf (smb-writer-queue w)
+                     (nconc (smb-writer-queue w)
+                            (list (list n (%write-request s (smb-writer-fid w) (smb-writer-offset w) buf i (+ i n))))))
+               (incf (smb-writer-offset w) n)
+               (incf i n)))
+    (setf (smb-writer-fill w) 0)))
+
+(defun smb-write (w data &key (start 0) (end (length data)))
+  "DATA[START,END) written next (copied at once: DATA may be reused when this returns)."
+  (loop while (< start end)
+        do (let* ((buf (smb-writer-buf w)) (n (min (- end start) (- (length buf) (smb-writer-fill w)))))
+             (replace buf data :start1 (smb-writer-fill w) :start2 start :end2 (+ start n))
+             (incf (smb-writer-fill w) n)
+             (incf start n)
+             (when (= (smb-writer-fill w) (length buf)) (%writer-flush w)))))
+
+(defun smb-finish-write (w)
+  "Everything written and answered, and the file closed.  The bytes written."
+  (%writer-flush w)
+  (loop while (smb-writer-queue w) do (%writer-take w))
+  (%close (smb-writer-session w) (smb-writer-fid w))
+  (smb-writer-offset w))
+
+(defun smb-abandon-write (w)
+  "Given up: what is in flight answered and dropped, the file closed as it is."
+  (let ((s (smb-writer-session w)))
+    (%drain s (mapcar #'second (smb-writer-queue w)))
+    (setf (smb-writer-queue w) '())
+    (let ((*wait-hook* nil)) (ignore-errors (%close s (smb-writer-fid w))))))
 
 (defun smb-get (s path local &key progress)
   "Copy PATH to the LOCAL file.  PROGRESS, if given, is called with the bytes so far.  The size."
@@ -401,13 +543,16 @@
 (defun smb-put (s local path &key progress)
   "Copy the LOCAL file to PATH, replacing it.  PROGRESS, if given, is called with the bytes so far."
   (with-open-file (in local :element-type '(unsigned-byte 8))
-    (with-handle (fid s path :access +write-access+ :disposition 5 :options #x40)
-      (let* ((chunk (%chunk s (smb-session-max-write s))) (buf (octets chunk)) (at 0))
-        (loop (let ((n (read-sequence buf in)))
-                (when (zerop n) (return at))
-                (let ((i 0)) (loop while (< i n) do (incf i (%write s fid (+ at i) buf i n))))
-                (incf at n)
-                (when progress (funcall progress at))))))))
+    (let ((w (smb-open-write s path)) (ok nil))
+      (unwind-protect
+           (let ((buf (octets (length (smb-writer-buf w)))) (at 0))
+             (loop (let ((n (read-sequence buf in)))
+                     (when (zerop n) (return))
+                     (smb-write w buf :end n)                   ; in flight: counted as it is sent
+                     (incf at n)
+                     (when progress (funcall progress at))))
+             (prog1 (smb-finish-write w) (setf ok t)))
+        (unless ok (smb-abandon-write w))))))
 
 ;;; ---- changing the tree ----------------------------------------------------------------------------
 
