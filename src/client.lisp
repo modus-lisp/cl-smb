@@ -42,7 +42,13 @@
   (next-mid 0) (credits 1) (session-id 0) (tree-id 0)
   dialect (max-read 65536) (max-write 65536)
   key signing-key signing-p
-  server-signing-required)
+  server-signing-required
+  ;; reused for every message, so a megabyte moved is not megabytes of garbage
+  (send-buf (octets 0)) (recv-buf (octets 0)))
+
+(defun %room (v n)
+  "V if it holds N bytes, else a bigger one (twice, to grow seldom)."
+  (if (>= (length v) n) v (octets (max n (* 2 (length v))))))
 
 (defun %resolve (host)
   (handler-case (sb-bsd-sockets:make-inet-address host)
@@ -55,26 +61,32 @@
                                                          :element-type '(unsigned-byte 8)
                                                          :buffering :full))))
 
-(defun %read-exactly (stream n)
-  (let ((v (octets n)) (got 0))
+(defun %read-exactly (stream n &optional (v (octets n)))
+  "N bytes from STREAM into V (fresh unless given, then at its start)."
+  (let ((got 0))
     (loop while (< got n)
-          do (let ((k (read-sequence v stream :start got)))
+          do (let ((k (read-sequence v stream :start got :end n)))
                (when (= k got) (error 'smb-error :message "the server closed the connection"))
                (setf got k)))
     v))
 
-(defun %send-frame (s msg)
-  "MSG with its 4-byte Direct TCP length (a zero byte, then 24 bits big-endian)."
-  (let ((n (length msg)) (st (smb-session-stream s)))
+(defun %send-frame (s msg &optional (n (length msg)))
+  "MSG's first N bytes with their 4-byte Direct TCP length (a zero byte, then 24 bits big-endian)."
+  (let ((st (smb-session-stream s)))
     (write-sequence (octets-of 0 (ldb (byte 8 16) n) (ldb (byte 8 8) n) (ldb (byte 8 0) n)) st)
-    (write-sequence msg st)
+    (write-sequence msg st :end n)
     (finish-output st)))
 
-(defun %recv-frame (s)
+(defun %recv-frame (s &optional reuse)
+  "The next frame: (values bytes length).  REUSE: into the session's receive buffer (good until the next
+   frame), else a fresh vector of its own."
   (when *wait-hook* (funcall *wait-hook*))
   (let* ((st (smb-session-stream s)) (hd (%read-exactly st 4))
          (n (logior (ash (aref hd 1) 16) (ash (aref hd 2) 8) (aref hd 3))))
-    (%read-exactly st n)))
+    (if reuse
+        (let ((buf (setf (smb-session-recv-buf s) (%room (smb-session-recv-buf s) n))))
+          (values (%read-exactly st n buf) n))
+        (values (%read-exactly st n) n))))
 
 ;;; ---- the header and signing ----------------------------------------------------------------------
 
@@ -86,13 +98,17 @@
   "SP 800-108 in counter mode with HMAC-SHA256, one block, L = 128 (MS-SMB2 3.1.4.2)."
   (subseq (natrium:hmac-sha256 key (cat (be32 1) label (octets 1) context (be32 128))) 0 16))
 
-(defun %signature (s msg)
-  "The 16-byte signature of MSG (its signature field zeroed) under S's key."
-  (let ((m (copy-seq msg)))
-    (fill m 0 :start 48 :end 64)
-    (if (>= (smb-session-dialect s) #x0300)
-        (natrium:aes-cmac (smb-session-signing-key s) m)
-        (subseq (natrium:hmac-sha256 (smb-session-signing-key s) m) 0 16))))
+(defun %signature (s msg &optional (n (length msg)))
+  "The 16-byte signature of MSG's first N bytes under S's key.  Its signature field must be zero."
+  (if (>= (smb-session-dialect s) #x0300)
+      (natrium:aes-cmac (smb-session-signing-key s) msg :end n)
+      (subseq (natrium:hmac-sha256 (smb-session-signing-key s) (if (= n (length msg)) msg (subseq msg 0 n))) 0 16)))
+
+(defun %signature-ok-p (s r n)
+  "Whether the frame R (N long) carries S's signature: checked in place (the field is zeroed to check)."
+  (let ((sig (subseq r 48 64)))
+    (fill r 0 :start 48 :end 64)
+    (equalp sig (%signature s r n))))
 
 (defun %header (s command charge &key (tree-id (smb-session-tree-id s)))
   (let ((h (octets 64)))
@@ -107,34 +123,42 @@
     (put-u64 h 40 (smb-session-session-id s))
     h))
 
-(defun %request (s command body &key (charge 1) (sign (smb-session-signing-p s)) (ok '(0)) tree-id)
-  "Send COMMAND with BODY; (values STATUS RESPONSE-BODY HEADER).  Signals SMB-ERROR unless the status
-   is in OK.  CHARGE is the request's credit charge (a large read or write costs one per 64 KB)."
-  (let* ((msg (cat (if tree-id (%header s command charge :tree-id tree-id) (%header s command charge)) body))
+(defun %request (s command body &key (charge 1) (sign (smb-session-signing-p s)) (ok '(0)) tree-id
+                                     data (start 0) (end (and data (length data))) raw)
+  "Send COMMAND with BODY, then DATA[START,END) if given (a write's bytes, not copied out first);
+   (values STATUS RESPONSE-BODY HEADER).  RAW (a read's big answer): (values STATUS FRAME LENGTH), the
+   frame in the session's receive buffer, good until the next request.  Signals SMB-ERROR unless the
+   status is in OK.  CHARGE is the request's credit charge (a large read or write costs one per 64 KB)."
+  (let* ((header (if tree-id (%header s command charge :tree-id tree-id) (%header s command charge)))
+         (n (+ 64 (length body) (if data (- end start) 0)))
+         (msg (setf (smb-session-send-buf s) (%room (smb-session-send-buf s) n)))
          (mid (smb-session-next-mid s)))
+    (replace msg header)
+    (replace msg body :start1 64)
+    (when data (replace msg data :start1 (+ 64 (length body)) :start2 start :end2 end))
     (when sign
       (put-u32 msg 16 (logior (u32 msg 16) +flag-signed+))
-      (replace msg (%signature s msg) :start1 48))
+      (replace msg (%signature s msg n) :start1 48))
     (incf (smb-session-next-mid s) charge)
     (decf (smb-session-credits s) charge)
-    (%send-frame s msg)
+    (%send-frame s msg n)
     (loop
-      (let* ((r (%recv-frame s))
-             (status (u32 r 8)) (flags (u32 r 16)))
-        (unless (and (>= (length r) 64) (= (aref r 0) #xFE))
+      (multiple-value-bind (r rn) (%recv-frame s raw)
+       (let ((status (u32 r 8)) (flags (u32 r 16)))
+        (unless (and (>= rn 64) (= (aref r 0) #xFE))
           (error 'smb-error :message "the server answered with something that is not SMB2"))
         (incf (smb-session-credits s) (u16 r 14))
         (cond ((/= (u64 r 24) mid))                   ; not ours (an oplock break we did not ask for)
               ((and (= status #x103) (logtest flags +flag-async+)))   ; interim: the answer follows
               (t
                (when (and (smb-session-signing-p s) (logtest flags +flag-signed+)
-                          (not (equalp (subseq r 48 64) (%signature s r))))
+                          (not (%signature-ok-p s r rn)))
                  (error 'smb-error :message "a reply's signature does not match: the connection is not safe"))
                (unless (member status ok)
                  (error (if (member status '(#xC000006D #xC0000072 #xC0000071 #xC0000224 #xC000015B))
                             'smb-auth-error 'smb-error)
                         :status status))
-               (return (values status (subseq r 64) r))))))))
+               (return (if raw (values status r rn) (values status (subseq r 64 rn) r))))))))))
 
 ;;; ---- negotiate, logon, share ---------------------------------------------------------------------
 
@@ -308,15 +332,30 @@
   (let ((by-credits (if (>= (smb-session-dialect s) #x0210) (* 65536 (max 1 (smb-session-credits s))) 65536)))
     (min limit by-credits)))
 
-(defun %read (s fid offset n)
-  "Up to N bytes at OFFSET: an octet vector, empty at the end of the file."
+(defun %read-in-place (s fid offset n)
+  "Up to N bytes at OFFSET, where they arrived: (values FRAME START END) -- the session's receive buffer,
+   good until the next request; START = END at the end of the file."
   (multiple-value-bind (status r)
       (%request s 8 (cat (le16 49) (octets-of #x50 0) (le32 n) (le64 offset) fid
                          (le32 0) (le32 0) (le32 0) (le16 0) (le16 0) (octets 1))
-                :charge (%charge s n) :ok '(0 #xC0000011))
+                :charge (%charge s n) :ok '(0 #xC0000011) :raw t)
     (if (= status #xC0000011)
-        (octets 0)
-        (let ((off (- (aref r 2) 64))) (subseq r off (+ off (u32 r 4)))))))
+        (values r 0 0)
+        (let ((off (aref r (+ 64 2)))) (values r off (+ off (u32 r (+ 64 4))))))))
+
+(defun %read (s fid offset n)
+  "Up to N bytes at OFFSET: an octet vector, empty at the end of the file."
+  (multiple-value-bind (r start end) (%read-in-place s fid offset n)
+    (subseq r start end)))
+
+(defun %read-file (s path fn offset)
+  "FN called with (frame start end) for each piece of PATH from OFFSET, in place; the total."
+  (with-handle (fid s path)
+    (let ((at offset))
+      (loop (multiple-value-bind (r start end) (%read-in-place s fid at (%chunk s (smb-session-max-read s)))
+              (when (= start end) (return (- at offset)))
+              (funcall fn r start end)
+              (incf at (- end start)))))))
 
 (defun smb-read-range (s path offset length)
   "LENGTH bytes of PATH from OFFSET (fewer at its end)."
@@ -330,28 +369,23 @@
 
 (defun smb-read-file (s path fn &key (offset 0))
   "Call FN with each piece of PATH (an octet vector) from OFFSET to its end, in order.  The total."
-  (with-handle (fid s path)
-    (let ((at offset))
-      (loop (let ((v (%read s fid at (%chunk s (smb-session-max-read s)))))
-              (when (zerop (length v)) (return (- at offset)))
-              (funcall fn v)
-              (incf at (length v)))))))
+  (%read-file s path (lambda (r start end) (funcall fn (subseq r start end))) offset))
 
 (defun smb-get (s path local &key progress)
   "Copy PATH to the LOCAL file.  PROGRESS, if given, is called with the bytes so far.  The size."
   (with-open-file (out local :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
     (let ((done 0))
-      (smb-read-file s path (lambda (v) (write-sequence v out) (incf done (length v))
-                              (when progress (funcall progress done))))
+      (%read-file s path (lambda (r start end) (write-sequence r out :start start :end end) (incf done (- end start))
+                           (when progress (funcall progress done)))
+                  0)
       done)))
 
 (defun %write (s fid offset data start end)
   (let ((n (- end start)))
     (multiple-value-bind (status r)
         (%request s 9 (cat (le16 49) (le16 112) (le32 n) (le64 offset) fid
-                           (le32 0) (le32 0) (le16 0) (le16 0) (le32 0)
-                           (subseq data start end))
-                  :charge (%charge s n))
+                           (le32 0) (le32 0) (le16 0) (le16 0) (le32 0))
+                  :data data :start start :end end :charge (%charge s n))
       (declare (ignore status))
       (u32 r 4))))
 
